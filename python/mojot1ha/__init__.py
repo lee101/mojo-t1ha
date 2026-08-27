@@ -6,6 +6,7 @@ The upstream package's ``hash128`` and ``Hash`` APIs are implemented exactly.
 
 from __future__ import annotations
 
+import ctypes
 import threading
 
 import numpy as np
@@ -14,6 +15,12 @@ from ._lib import buffer_address_and_size, lib
 
 MASK64 = (1 << 64) - 1
 _RESULTS = threading.local()
+_LIB = lib()
+_T1HA2_ATONCE = _LIB.mt1_t1ha2_atonce
+_T1HA2_ATONCE128 = _LIB.mt1_t1ha2_atonce128
+_STREAM_INIT = _LIB.mt1_stream_init
+_STREAM_UPDATE = _LIB.mt1_stream_update
+_STREAM_FINAL = _LIB.mt1_stream_final
 
 
 def _seed(value: int) -> int:
@@ -24,26 +31,27 @@ def _seed(value: int) -> int:
     return value
 
 
-def _result_buffer() -> np.ndarray:
-    result = getattr(_RESULTS, "buffer", None)
-    if result is None:
-        result = np.empty(2, dtype=np.uint64)
-        _RESULTS.buffer = result
-    return result
+def _result_buffer() -> tuple[ctypes.Array[ctypes.c_uint64], int]:
+    cached = getattr(_RESULTS, "buffer", None)
+    if cached is None:
+        result = (ctypes.c_uint64 * 2)()
+        cached = result, ctypes.addressof(result)
+        _RESULTS.buffer = cached
+    return cached
 
 
 def t1ha2_atonce(data: bytes | bytearray | memoryview, seed: int = 0) -> int:
     """Return t1ha2's portable 64-bit at-once hash."""
     data_addr, length = buffer_address_and_size(data)
-    return int(lib().mt1_t1ha2_atonce(data_addr, length, _seed(seed)))
+    return int(_T1HA2_ATONCE(data_addr, length, _seed(seed)))
 
 
 def hash128(data: bytes | bytearray | memoryview, seed: int = 0) -> tuple[int, int]:
     """Return the upstream-compatible ``(high, low)`` t1ha2-128 digest."""
     data_addr, length = buffer_address_and_size(data)
-    result = _result_buffer()
-    lib().mt1_t1ha2_atonce128(data_addr, length, _seed(seed), result.ctypes.data)
-    return int(result[0]), int(result[1])
+    result, result_addr = _result_buffer()
+    _T1HA2_ATONCE128(data_addr, length, _seed(seed), result_addr)
+    return result[0], result[1]
 
 
 class Hash:
@@ -54,7 +62,7 @@ class Hash:
         self._buffer = np.zeros(32, dtype=np.uint8)
         self._meta = np.zeros(2, dtype=np.uint64)
         self._finalized = False
-        lib().mt1_stream_init(
+        _STREAM_INIT(
             self._state.ctypes.data, self._meta.ctypes.data, _seed(seed_x), _seed(seed_y)
         )
 
@@ -63,7 +71,7 @@ class Hash:
             raise ValueError("cannot update a finalized Hash")
         data_addr, length = buffer_address_and_size(data)
         if length:
-            lib().mt1_stream_update(
+            _STREAM_UPDATE(
                 self._state.ctypes.data,
                 self._buffer.ctypes.data,
                 self._meta.ctypes.data,
@@ -74,15 +82,15 @@ class Hash:
     def final(self) -> tuple[int, int]:
         if self._finalized:
             raise ValueError("Hash.final() may only be called once")
-        result = _result_buffer()
-        lib().mt1_stream_final(
+        result, result_addr = _result_buffer()
+        _STREAM_FINAL(
             self._state.ctypes.data,
             self._buffer.ctypes.data,
             self._meta.ctypes.data,
-            result.ctypes.data,
+            result_addr,
         )
         self._finalized = True
-        return int(result[0]), int(result[1])
+        return result[0], result[1]
 
 
 __all__ = ["Hash", "hash128", "t1ha2_atonce"]

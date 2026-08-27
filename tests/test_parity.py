@@ -74,6 +74,23 @@ def test_streaming_all_split_points_match_upstream(size):
         assert actual.final() == expected
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [(5, 27, 17), (17, 15, 33), (24,), (25,), (31,)],
+)
+def test_streaming_simd_copy_tails_and_final_wrap(chunks):
+    size = sum(chunks)
+    data = bytes((i * 41 + 9) & 0xFF for i in range(size))
+    expected = t1ha.Hash(7, 11)
+    expected.update(data)
+    actual = mojo.Hash(7, 11)
+    start = 0
+    for length in chunks:
+        actual.update(data[start : start + length])
+        start += length
+    assert actual.final() == expected.final()
+
+
 @pytest.mark.parametrize("size", [8, 32, 33, 4099])
 def test_misaligned_buffer_matches_upstream(size):
     payload = bytearray(size + 1)

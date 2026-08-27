@@ -1,5 +1,7 @@
 """Portable t1ha2 kernels exposed through a small C ABI."""
 
+from std.sys.info import simd_width_of as simdwidthof
+
 comptime U8Ptr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime U64Ptr = Pointer[UInt64, AnyOrigin[mut=True]]
 
@@ -36,13 +38,11 @@ def final64(a: UInt64, b: UInt64) -> UInt64:
 
 @always_inline
 def load64(data: U8Ptr, start: Int) -> UInt64:
-    var address = Int(data) + start
-    if (address & 7) == 0:
-        return U64Ptr(unsafe_from_address=address).unsafe_load(0)
-    var value = UInt64(0)
-    for j in range(8):
-        value |= UInt64(data.unsafe_load(start + j)) << UInt64(j * 8)
-    return value
+    return (
+        data.unsafe_offset(start)
+        .unsafe_bitcast[UInt64]()
+        .unsafe_load[alignment=1]()
+    )
 
 
 @always_inline
@@ -169,10 +169,12 @@ def atonce128(data: U8Ptr, length: Int, seed: UInt64, result: U64Ptr):
             var w3 = load64(data, pos + 24)
             var d02 = w0 + rot64(w2 + d, UInt64(56))
             var c13 = w1 + rot64(w3 + c, UInt64(19))
-            d = d ^ (b + rot64(w1, UInt64(38)))
-            c = c ^ (a + rot64(w0, UInt64(57)))
+            var old_a = a
+            var old_b = b
             b = b ^ (P6 * (c13 + w2))
             a = a ^ (P5 * (d02 + w3))
+            d = d ^ (old_b + rot64(w1, UInt64(38)))
+            c = c ^ (old_a + rot64(w0, UInt64(57)))
             pos += 32
     state.unsafe_store(0, a)
     state.unsafe_store(1, b)
@@ -214,8 +216,18 @@ def mt1_stream_update(state_addr: Int, buffer_addr: Int, meta_addr: Int, data_ad
     if partial > 0:
         var needed = 32 - partial
         var chunk = needed if length >= needed else length
-        for i in range(chunk):
+        comptime W = simdwidthof[DType.float64]()
+        var i = 0
+        if chunk >= 16:
+            while i + W <= chunk:
+                buffer.unsafe_store[alignment=1](
+                    partial + i,
+                    data.unsafe_load[width=W, alignment=1](i),
+                )
+                i += W
+        while i < chunk:
             buffer.unsafe_store(partial + i, data.unsafe_load(i))
+            i += 1
         partial += chunk
         pos += chunk
         if partial < 32:
@@ -227,8 +239,18 @@ def mt1_stream_update(state_addr: Int, buffer_addr: Int, meta_addr: Int, data_ad
         update_block(state, data, pos)
         pos += 32
     var remaining = length - pos
-    for i in range(remaining):
+    comptime W = simdwidthof[DType.float64]()
+    var i = 0
+    if remaining >= 16:
+        while i + W <= remaining:
+            buffer.unsafe_store[alignment=1](
+                i,
+                data.unsafe_load[width=W, alignment=1](pos + i),
+            )
+            i += W
+    while i < remaining:
         buffer.unsafe_store(i, data.unsafe_load(pos + i))
+        i += 1
     meta.unsafe_store(0, UInt64(remaining))
 
 
@@ -238,6 +260,26 @@ def mt1_stream_final(state_addr: Int, buffer_addr: Int, meta_addr: Int, result_a
     var buffer = U8Ptr(unsafe_from_address=buffer_addr)
     var meta = U64Ptr(unsafe_from_address=meta_addr)
     var total_bits = (meta.unsafe_load(1) << UInt64(3)) ^ (UInt64(1) << UInt64(63))
-    var bits = SIMD[DType.uint64, 1](total_bits)
-    mt1_stream_update(state_addr, buffer_addr, meta_addr, Int(Pointer(to=bits)), 8)
-    tail_abcd(state, buffer, 0, Int(meta.unsafe_load(0)), U64Ptr(unsafe_from_address=result_addr))
+    var partial = Int(meta.unsafe_load(0))
+    var first = 8
+    if partial + 8 > 32:
+        first = 32 - partial
+    for i in range(first):
+        buffer.unsafe_store(
+            partial + i, UInt8(total_bits >> UInt64(i * 8))
+        )
+    partial += first
+    if partial == 32:
+        update_block(state, buffer, 0)
+        partial = 0
+    for i in range(first, 8):
+        buffer.unsafe_store(
+            partial + i - first, UInt8(total_bits >> UInt64(i * 8))
+        )
+    partial += 8 - first
+    meta.unsafe_store(0, UInt64(partial))
+    meta.unsafe_store(1, meta.unsafe_load(1) + UInt64(8))
+    tail_abcd(
+        state, buffer, 0, partial,
+        U64Ptr(unsafe_from_address=result_addr),
+    )

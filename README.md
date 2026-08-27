@@ -48,14 +48,14 @@ Measured with `pixi run bench` on Linux 6.8.0-136-generic, x86_64, glibc 2.39. E
 
 | case | mojo-t1ha | upstream t1ha | upstream / Mojo | result |
 |---|---:|---:|---:|---|
-| hash128, 64 B x 400 | 1.87 ms | 0.21 ms | 0.11x | slower |
-| hash128, 4,096 B x 400 | 2.06 ms | 0.37 ms | 0.18x | slower |
-| hash128, 1,048,576 B x 400 | 46.87 ms | 35.29 ms | 0.75x | slower |
+| hash128, 64 B x 400 | 1.46 ms | 0.31 ms | 0.21x | slower |
+| hash128, 4,096 B x 400 | 0.88 ms | 0.26 ms | 0.29x | slower |
+| hash128, 1,048,576 B x 400 | 38.55 ms | 34.38 ms | 0.89x | slower |
 
 ## How it works
 
-All kernels live in one Mojo compilation unit, `src/capi.mojo`, to keep build cost fixed. Python passes contiguous byte-buffer addresses and lengths through `ctypes`; Mojo reconstructs typed pointers at the C ABI boundary, performs little-endian reads and 64-by-64-to-128 mixing, and writes the two 64-bit digest lanes into a caller-owned NumPy array.
+All kernels live in one Mojo compilation unit, `src/capi.mojo`, to keep build cost fixed. Python passes contiguous byte-buffer addresses and lengths through `ctypes`; Mojo reconstructs typed pointers at the C ABI boundary, performs little-endian reads and 64-by-64-to-128 mixing, and writes the two 64-bit digest lanes into a thread-local caller-owned C array.
 
 The incremental hasher keeps its four `UInt64` state lanes, 32-byte partial block, and counters in NumPy-owned contiguous buffers. No Mojo-side allocation crosses the FFI boundary. The wrapper accepts only one-dimensional, C-contiguous byte buffers and retains the exported buffer through each native call. Tests compare `hash128` and streaming `Hash` directly with the installed upstream `t1ha` package, and test `t1ha2_atonce` against fixed vectors generated from the upstream C implementation.
 
-The CPU kernel uses aligned native 64-bit reads, with a bytewise fallback for unaligned buffer views. Its 32-byte state transition depends on the preceding transition, so blocks cannot be safely SIMD-vectorized or parallelized within one hash. No GPU path is included.
+The CPU kernel uses native unaligned 64-bit reads. Independent streaming-buffer copies use the host SIMD width with a scalar remainder loop. The 32-byte hash transition depends on the preceding transition, so compression blocks cannot be safely SIMD-vectorized or parallelized within one hash. The transition also has well under two integer operations per byte moved, so a GPU path would lose to transfer and launch overhead; no GPU dependency or path is included.
